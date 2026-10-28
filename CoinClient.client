@@ -1,0 +1,116 @@
+-- Connected Discord GitHub
+-- Client side of the coin collector: spins and bobs every coin locally (zero network cost)
+-- and shows an arcade style combo HUD (multiplier, title and a bar that drains over the combo window).
+-- Setup: LocalScript in StarterPlayer > StarterPlayerScripts.
+
+local Players = game:GetService("Players") -- Gives us the local player, whose attributes the server writes
+local RunService = game:GetService("RunService") -- RenderStepped runs right before each frame is drawn
+local CollectionService = game:GetService("CollectionService") -- Finds coins by tag as the server creates them
+local Workspace = game:GetService("Workspace") -- GetServerTimeNow keeps the countdown in sync with the server
+local TweenService = game:GetService("TweenService") -- Animates the pop effect when the multiplier grows
+
+local player = Players.LocalPlayer
+local COIN_TAG = "Coin" -- Must match CONFIG.CoinTag in the server script
+local SPIN_SPEED = 2.5 -- Radians per second
+local BOB_HEIGHT = 0.6 -- Studs the coin moves up and down
+local BOB_SPEED = 2 -- Bob cycles are 2*pi / BOB_SPEED seconds long
+
+local coins = {} -- [Part] = phase offset, so coins don't all move in lockstep
+
+local function trackCoin(part: BasePart)
+	coins[part] = math.random() * math.pi * 2 -- Random starting angle for variety
+end
+
+CollectionService:GetInstanceAddedSignal(COIN_TAG):Connect(trackCoin) -- Coins respawn as new instances, so this fires again
+CollectionService:GetInstanceRemovedSignal(COIN_TAG):Connect(function(part)
+	coins[part] = nil -- Stops animating collected coins and lets them be garbage collected
+end)
+for _, part in ipairs(CollectionService:GetTagged(COIN_TAG)) do
+	trackCoin(part) -- Covers coins that already existed before this script ran
+end
+
+local function create(className: string, properties: {[string]: any}, parent: Instance): Instance
+	local instance = Instance.new(className)
+	for name, value in pairs(properties) do
+		instance[name] = value
+	end
+	instance.Parent = parent
+	return instance
+end
+
+local gui = create("ScreenGui", {Name = "ComboHud", ResetOnSpawn = false}, player:WaitForChild("PlayerGui")) -- ResetOnSpawn false keeps the HUD across deaths
+local frame = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.fromScale(0.5, 0.1),
+	Size = UDim2.fromOffset(240, 110),
+	BackgroundTransparency = 1, -- No panel, like the reference: only text and bar float on screen
+	Visible = false,
+}, gui)
+local countLabel = create("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Arcade, -- Roblox's built-in pixel font matches the reference style
+	TextSize = 30,
+	TextColor3 = Color3.fromRGB(235, 50, 50),
+	TextStrokeTransparency = 0, -- Solid black outline keeps the text readable on any background
+}, frame)
+local countScale = create("UIScale", {}, countLabel) -- Scaling a UIScale is the cheapest way to animate text size
+create("TextLabel", {
+	Position = UDim2.fromOffset(0, 30),
+	Size = UDim2.new(1, 0, 0, 52),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Arcade,
+	Text = "Combo",
+	TextSize = 48,
+	TextColor3 = Color3.new(1, 1, 1),
+	TextStrokeTransparency = 0,
+}, frame)
+local barBack = create("Frame", {
+	Position = UDim2.new(0, 10, 0, 90),
+	Size = UDim2.new(1, -20, 0, 5),
+	BackgroundColor3 = Color3.fromRGB(35, 35, 35), -- Dark track shows how much time has already drained
+	BorderSizePixel = 0,
+}, frame)
+local barFill = create("Frame", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = Color3.fromRGB(225, 40, 40),
+	BorderSizePixel = 0,
+}, barBack)
+
+local popInfo = TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out) -- Back easing overshoots slightly, giving a punchy pop
+local lastCombo = 0 -- Remembers the previous multiplier so the pop only plays when it changes
+
+local function updateCoins()
+	local t = os.clock() -- Monotonic clock; drives both spin and bob
+	for part, phase in pairs(coins) do
+		local base = part:GetAttribute("Base") -- Set by the server before parenting
+		if base then
+			local bob = math.sin(t * BOB_SPEED + phase) * BOB_HEIGHT
+			part.CFrame = CFrame.new(base + Vector3.new(0, bob, 0)) * CFrame.Angles(0, t * SPIN_SPEED + phase, 0) -- Translate first, then rotate around the coin's own Y axis
+		end
+	end
+end
+
+local function updateHud()
+	local combo = player:GetAttribute("Combo") or 0
+	local window = player:GetAttribute("ComboWindow") or 5
+	local remaining = (player:GetAttribute("ComboExpires") or 0) - Workspace:GetServerTimeNow()
+	if combo <= 0 or remaining <= 0 then
+		frame.Visible = false -- No active combo, nothing to show
+		lastCombo = 0 -- Reset so the next combo starts with a pop again
+		return
+	end
+	frame.Visible = true
+	countLabel.Text = "x" .. combo
+	barFill.Size = UDim2.fromScale(math.clamp(remaining / window, 0, 1), 1) -- Bar length is the fraction of the window still left
+	if combo ~= lastCombo then
+		lastCombo = combo
+		countScale.Scale = 1.6 -- Start enlarged, then shrink back for the pop
+		TweenService:Create(countScale, popInfo, {Scale = 1}):Play()
+	end
+end
+
+RunService.RenderStepped:Connect(function()
+	updateCoins() -- One connection for both jobs avoids two per-frame callbacks
+	updateHud()
+end)
